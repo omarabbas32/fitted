@@ -1,0 +1,98 @@
+// Fitted — CV-to-JD tailoring tool
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+/// A base CV uploaded by the user (parsed from a PDF).
+model Cv {
+  id             String         @id @default(cuid())
+  title          String
+  sourceFileName String?
+  rawText        String?        @db.LongText
+  structured     Json // structured CV JSON (name, summary, experience, ...)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  conversations  Conversation[]
+  versions       CvVersion[]
+}
+
+/// A target job the user wants to tailor a CV for.
+model Job {
+  id            String         @id @default(cuid())
+  title         String
+  company       String?
+  description   String         @db.LongText
+  createdAt     DateTime       @default(now())
+
+  conversations Conversation[]
+  versions      CvVersion[]
+}
+
+/// One tailoring session: a base CV + a job + the chat + the working draft.
+model Conversation {
+  id        String      @id @default(cuid())
+  cv        Cv          @relation(fields: [cvId], references: [id], onDelete: Cascade)
+  cvId      String
+  job       Job         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId     String
+  draft     Json? // current working structured CV (before saving a version)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  messages  Message[]
+  versions  CvVersion[]
+
+  @@index([cvId])
+  @@index([jobId])
+}
+
+/// A single chat message within a conversation.
+model Message {
+  id             String       @id @default(cuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String
+  role           String // "user" | "assistant"
+  content        String       @db.LongText
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId])
+}
+
+/// A saved, tailored CV version tied to a job.
+model CvVersion {
+  id             String        @id @default(cuid())
+  name           String
+  cv             Cv            @relation(fields: [cvId], references: [id], onDelete: Cascade)
+  cvId           String
+  job            Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId          String
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  conversationId String?
+  structured     Json
+  changeSummary  String?       @db.LongText
+  matchNotes     Json?
+  matchScore     Int?
+  baseMatchScore Int?
+  pdfPath        String?
+  createdAt      DateTime      @default(now())
+
+  @@index([cvId])
+  @@index([jobId])
+}
+
+/// Singleton row holding UI-editable AI provider config.
+model Setting {
+  id        Int      @id @default(1)
+  aiBaseUrl String   @default("https://agentrouter.org")
+  aiApiKey  String?  @db.Text
+  aiModel   String   @default("claude-sonnet-5")
+  updatedAt DateTime @updatedAt
+}

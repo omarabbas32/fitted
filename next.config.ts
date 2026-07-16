@@ -1,7 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  serverExternalPackages: [
+    "puppeteer",
+    "puppeteer-core",
+    "@prisma/adapter-mariadb",
+    "mariadb",
+    "unpdf",
+  ],
 };
 
 export default nextConfig;
