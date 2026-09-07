@@ -14,6 +14,12 @@ function link(raw: string): string {
   return `<a href="${esc(normalizeUrl(raw))}">${esc(linkDisplay(raw))}</a>`;
 }
 
+/** Join the filled-in parts of a one-line entry, escaped, so a half-filled
+ *  award or publication doesn't render stray separators. */
+function dotted(...parts: (string | undefined)[]): string {
+  return parts.filter(Boolean).map((p) => esc(p)).join(" · ");
+}
+
 /** Render a structured CV to a full, self-contained HTML document (used for PDF export). */
 export function cvToHtml(cv: StructuredCv): string {
   const contact = cv.contact || {};
@@ -54,6 +60,10 @@ export function cvToHtml(cv: StructuredCv): string {
 
   const skills = (cv.skills || []).map(esc).join(" · ");
 
+  const languages = (cv.languages || [])
+    .map((l) => esc(l.level ? `${l.name} (${l.level})` : l.name))
+    .join(" · ");
+
   const projects = (cv.projects || [])
     .map(
       (p) => `
@@ -75,8 +85,40 @@ export function cvToHtml(cv: StructuredCv): string {
     .map((c) => `<li>${esc(c)}</li>`)
     .join("");
 
+  const awards = (cv.awards || [])
+    .map((a) => `<li>${dotted(a.title, a.issuer, a.year)}</li>`)
+    .join("");
+
+  const publications = (cv.publications || [])
+    .map(
+      (p) =>
+        `<li>${dotted(p.title, p.venue, p.year)}${
+          p.link ? `  ${link(p.link)}` : ""
+        }</li>`
+    )
+    .join("");
+
+  const volunteering = (cv.volunteering || [])
+    .map(
+      (v) => `
+      <div class="exp">
+        <div class="top"><b>${esc(v.role || v.org)}</b><span class="when">${esc(
+          [v.start, v.end].filter(Boolean).join(" — ")
+        )}</span></div>
+        ${v.role ? `<div class="co">${esc(v.org)}</div>` : ""}
+        ${
+          v.bullets && v.bullets.length
+            ? `<ul>${v.bullets.map((b) => `<li>${esc(b)}</li>`).join("")}</ul>`
+            : ""
+        }
+      </div>`
+    )
+    .join("");
+
   const section = (title: string, body: string) =>
     body.trim() ? `<h3>${title}</h3>${body}` : "";
+  const listSection = (title: string, items: string) =>
+    section(title, items ? `<ul class="certs">${items}</ul>` : "");
 
   return `<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -110,8 +152,12 @@ export function cvToHtml(cv: StructuredCv): string {
   ${cv.summary ? `<h3>Summary</h3><p class="sum">${esc(cv.summary)}</p>` : ""}
   ${section("Experience", experience)}
   ${section("Skills", skills ? `<div class="skills-line">${skills}</div>` : "")}
+  ${section("Languages", languages ? `<div class="skills-line">${languages}</div>` : "")}
   ${section("Projects", projects)}
   ${section("Education", education)}
-  ${section("Certifications", certs ? `<ul class="certs">${certs}</ul>` : "")}
+  ${listSection("Certifications", certs)}
+  ${listSection("Awards", awards)}
+  ${listSection("Publications", publications)}
+  ${section("Volunteering", volunteering)}
 </body></html>`;
 }

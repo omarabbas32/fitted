@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/prisma";
 import { extractPdfText } from "@/lib/pdf/extract";
 import { parseCvFromText } from "@/lib/ai";
-import type { StructuredCv } from "@/lib/cv-schema";
+import { emptyCv, type StructuredCv } from "@/lib/cv-schema";
 import type { CvDto } from "@/lib/dto";
 
 function toCvDto(cv: {
@@ -52,6 +52,29 @@ export async function uploadCv(formData: FormData): Promise<CvDto> {
 
   revalidatePath("/");
   return toCvDto(cv);
+}
+
+/** Create an empty base CV to fill in by hand — the path in for someone who
+ *  has no PDF to upload. Deliberately does not call the model: there is
+ *  nothing to parse yet, and inventing a starting point would be fabrication. */
+export async function createBlankCv(title?: string): Promise<CvDto> {
+  const cv = await prisma.cv.create({
+    data: {
+      title: title?.trim() || "Untitled CV",
+      structured: emptyCv() as unknown as object,
+    },
+  });
+
+  revalidatePath("/");
+  return toCvDto(cv);
+}
+
+/** Rename a base CV. */
+export async function renameCv(id: string, title: string): Promise<void> {
+  const name = title.trim();
+  if (!name) throw new Error("Name is empty.");
+  await prisma.cv.update({ where: { id }, data: { title: name } });
+  revalidatePath("/");
 }
 
 export async function listCvs(): Promise<CvDto[]> {

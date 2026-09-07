@@ -48,6 +48,13 @@ export async function saveVersion(
   });
   const draft = conv.draft as TailorResult | null;
   if (!draft) throw new Error("Nothing to save — generate a tailored CV first.");
+  // A version is a CV pinned to a job. An edit session has no job, so there is
+  // nothing to pin it to — that draft is saved over the CV itself instead.
+  if (!conv.job || !conv.jobId) {
+    throw new Error(
+      "This session has no job attached. Save it to your CV instead of as a version."
+    );
+  }
 
   const version = await prisma.cvVersion.create({
     data: {
