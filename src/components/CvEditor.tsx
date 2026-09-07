@@ -15,6 +15,12 @@ const fromLines = (s: string) =>
 const fromCommas = (s: string) =>
   s.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
 
+/** The optional sections are all "array of small objects" with identical add /
+ *  patch / remove moves, so they share one set of helpers rather than four
+ *  near-identical copies of the Experience/Education pattern. */
+type ListKey = "languages" | "awards" | "publications" | "volunteering";
+type ListItem<K extends ListKey> = NonNullable<StructuredCv[K]>[number];
+
 export function CvEditor({
   initial,
   onSave,
@@ -55,6 +61,40 @@ export function CvEditor({
       return { ...c, projects };
     });
   }
+
+  // A computed key defeats TypeScript's object-literal narrowing, so each of
+  // these rebuilds one known-good array and asserts the result back.
+  const listOf = <K extends ListKey>(c: StructuredCv, key: K) =>
+    (c[key] || []) as ListItem<K>[];
+
+  function addItem<K extends ListKey>(key: K, item: ListItem<K>) {
+    setCv((c) => ({ ...c, [key]: [...listOf(c, key), item] } as StructuredCv));
+  }
+  function updItem<K extends ListKey>(
+    key: K,
+    i: number,
+    patch: Partial<ListItem<K>>
+  ) {
+    setCv((c) => {
+      const list = [...listOf(c, key)];
+      list[i] = { ...list[i], ...patch };
+      return { ...c, [key]: list } as StructuredCv;
+    });
+  }
+  function delItem<K extends ListKey>(key: K, i: number) {
+    setCv(
+      (c) =>
+        ({
+          ...c,
+          [key]: listOf(c, key).filter((_, j) => j !== i),
+        } as StructuredCv)
+    );
+  }
+
+  const languages = cv.languages || [];
+  const awards = cv.awards || [];
+  const publications = cv.publications || [];
+  const volunteering = cv.volunteering || [];
 
   return (
     <div className="editor">
@@ -164,6 +204,77 @@ export function CvEditor({
       <div className="ed-sec">
         <label className="field-l">Certifications (one per line)</label>
         <textarea className="input" rows={2} value={toLines(cv.certifications)} onChange={(e) => set({ certifications: fromLines(e.target.value) })} />
+      </div>
+
+      <div className="ed-sec">
+        <div className="ed-sec-head">
+          Languages
+          <button className="btn btn-ghost btn-sm" onClick={() => addItem("languages", { name: "" })}>+ Add</button>
+        </div>
+        {languages.map((l, i) => (
+          <div className="ed-card" key={i}>
+            <div className="ed-grid">
+              <input className="input" placeholder="Language" value={l.name || ""} onChange={(ev) => updItem("languages", i, { name: ev.target.value })} />
+              <input className="input" placeholder="Level (e.g. Native, B2)" value={l.level || ""} onChange={(ev) => updItem("languages", i, { level: ev.target.value })} />
+            </div>
+            <button className="btn btn-danger btn-sm" onClick={() => delItem("languages", i)}>Remove</button>
+          </div>
+        ))}
+      </div>
+
+      <div className="ed-sec">
+        <div className="ed-sec-head">
+          Awards
+          <button className="btn btn-ghost btn-sm" onClick={() => addItem("awards", { title: "" })}>+ Add</button>
+        </div>
+        {awards.map((a, i) => (
+          <div className="ed-card" key={i}>
+            <div className="ed-grid">
+              <input className="input" placeholder="Award" value={a.title || ""} onChange={(ev) => updItem("awards", i, { title: ev.target.value })} />
+              <input className="input" placeholder="Issuer" value={a.issuer || ""} onChange={(ev) => updItem("awards", i, { issuer: ev.target.value })} />
+              <input className="input" placeholder="Year" value={a.year || ""} onChange={(ev) => updItem("awards", i, { year: ev.target.value })} />
+            </div>
+            <button className="btn btn-danger btn-sm" onClick={() => delItem("awards", i)}>Remove</button>
+          </div>
+        ))}
+      </div>
+
+      <div className="ed-sec">
+        <div className="ed-sec-head">
+          Publications
+          <button className="btn btn-ghost btn-sm" onClick={() => addItem("publications", { title: "" })}>+ Add</button>
+        </div>
+        {publications.map((p, i) => (
+          <div className="ed-card" key={i}>
+            <div className="ed-grid">
+              <input className="input" placeholder="Title" value={p.title || ""} onChange={(ev) => updItem("publications", i, { title: ev.target.value })} />
+              <input className="input" placeholder="Venue (journal, conference)" value={p.venue || ""} onChange={(ev) => updItem("publications", i, { venue: ev.target.value })} />
+              <input className="input" placeholder="Year" value={p.year || ""} onChange={(ev) => updItem("publications", i, { year: ev.target.value })} />
+              <input className="input" placeholder="Link (URL)" value={p.link || ""} onChange={(ev) => updItem("publications", i, { link: ev.target.value })} />
+            </div>
+            <button className="btn btn-danger btn-sm" onClick={() => delItem("publications", i)}>Remove</button>
+          </div>
+        ))}
+      </div>
+
+      <div className="ed-sec">
+        <div className="ed-sec-head">
+          Volunteering
+          <button className="btn btn-ghost btn-sm" onClick={() => addItem("volunteering", { org: "" })}>+ Add</button>
+        </div>
+        {volunteering.map((v, i) => (
+          <div className="ed-card" key={i}>
+            <div className="ed-grid">
+              <input className="input" placeholder="Organisation" value={v.org || ""} onChange={(ev) => updItem("volunteering", i, { org: ev.target.value })} />
+              <input className="input" placeholder="Role" value={v.role || ""} onChange={(ev) => updItem("volunteering", i, { role: ev.target.value })} />
+              <input className="input" placeholder="Start" value={v.start || ""} onChange={(ev) => updItem("volunteering", i, { start: ev.target.value })} />
+              <input className="input" placeholder="End" value={v.end || ""} onChange={(ev) => updItem("volunteering", i, { end: ev.target.value })} />
+            </div>
+            <label className="field-l" style={{ marginTop: 8 }}>Bullets (one per line)</label>
+            <textarea className="input" rows={2} value={toLines(v.bullets)} onChange={(ev) => updItem("volunteering", i, { bullets: fromLines(ev.target.value) })} />
+            <button className="btn btn-danger btn-sm" onClick={() => delItem("volunteering", i)}>Remove</button>
+          </div>
+        ))}
       </div>
 
       <div className="ed-actions">

@@ -2,6 +2,12 @@ import type { StructuredCv } from "@/lib/cv-schema";
 import { normalizeUrl, linkDisplay, isRealLink } from "@/lib/links";
 import { fontStack } from "@/lib/fonts";
 
+/** Join the parts of a one-line entry, skipping the ones that are missing.
+ *  Sections like Awards and Publications carry optional issuer/venue/year, and
+ *  a half-filled entry must not render stray separators. */
+const dotted = (...parts: (string | undefined)[]) =>
+  parts.filter(Boolean).join(" · ");
+
 /** On-screen "paper" rendering of a structured CV (mirrors the PDF template). */
 export function CvPaper({ cv }: { cv: StructuredCv }) {
   const c = cv.contact || {};
@@ -73,6 +79,17 @@ export function CvPaper({ cv }: { cv: StructuredCv }) {
         </>
       )}
 
+      {cv.languages && cv.languages.length > 0 && (
+        <>
+          <h3>Languages</h3>
+          <div className="p-skills-line">
+            {cv.languages
+              .map((l) => (l.level ? `${l.name} (${l.level})` : l.name))
+              .join(" · ")}
+          </div>
+        </>
+      )}
+
       {cv.projects && cv.projects.length > 0 && (
         <>
           <h3>Projects</h3>
@@ -127,13 +144,71 @@ export function CvPaper({ cv }: { cv: StructuredCv }) {
       {cv.certifications && cv.certifications.length > 0 && (
         <>
           <h3>Certifications</h3>
-          <ul>
+          <ul className="p-list">
             {cv.certifications.map((ct, i) => (
-              <li key={i} style={{ fontSize: "11.5px", color: "#333" }}>
-                {ct}
+              <li key={i}>{ct}</li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {cv.awards && cv.awards.length > 0 && (
+        <>
+          <h3>Awards</h3>
+          <ul className="p-list">
+            {cv.awards.map((a, i) => (
+              <li key={i}>{dotted(a.title, a.issuer, a.year)}</li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {cv.publications && cv.publications.length > 0 && (
+        <>
+          <h3>Publications</h3>
+          <ul className="p-list">
+            {cv.publications.map((p, i) => (
+              <li key={i}>
+                {dotted(p.title, p.venue, p.year)}
+                {p.link && (
+                  <>
+                    {"  "}
+                    <a
+                      href={normalizeUrl(p.link)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {linkDisplay(p.link)}
+                    </a>
+                  </>
+                )}
               </li>
             ))}
           </ul>
+        </>
+      )}
+
+      {cv.volunteering && cv.volunteering.length > 0 && (
+        <>
+          <h3>Volunteering</h3>
+          {cv.volunteering.map((v, i) => (
+            <div className="p-exp" key={i}>
+              <div className="p-top">
+                <b>{v.role || v.org}</b>
+                <span className="p-when">
+                  {[v.start, v.end].filter(Boolean).join(" — ")}
+                </span>
+              </div>
+              {v.role && <div className="p-co">{v.org}</div>}
+              {v.bullets && v.bullets.length > 0 && (
+                <ul>
+                  {v.bullets.map((b, j) => (
+                    <li key={j}>{b}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
         </>
       )}
     </div>

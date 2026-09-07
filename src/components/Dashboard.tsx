@@ -3,14 +3,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  ArrowLeft,
   ArrowUp,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Download,
+  FilePlus,
   FileText,
   FileUp,
+  GitCompare,
   ListChecks,
   Minus,
   Moon,
@@ -22,17 +25,22 @@ import {
   Sun,
   Target,
   Trash2,
+  Undo2,
   User,
   Wand2,
 } from "lucide-react";
-import type { CvDto, VersionDto, ConversationDto } from "@/lib/dto";
-import type { StructuredCv } from "@/lib/cv-schema";
+import type { CvDto, VersionDto, ConversationDto, MessageDto } from "@/lib/dto";
+import { coercePartialCv, type ChatMode, type StructuredCv } from "@/lib/cv-schema";
 import type { SettingsView } from "@/app/actions/settings";
-import { uploadCv } from "@/app/actions/cv";
+import { diffCv } from "@/lib/cv-diff";
+import { parsePartialJson } from "@/lib/partial-json";
+import { readStream } from "@/lib/stream-protocol";
+import { createBlankCv, deleteCv, renameCv, uploadCv } from "@/app/actions/cv";
+import { proposeCvUpdate } from "@/app/actions/intake";
 import {
   createConversation,
-  generateTailoredCv,
-  sendChatMessage,
+  saveEditToCv,
+  startEditSession,
 } from "@/app/actions/tailor";
 import {
   saveVersion,
@@ -45,10 +53,28 @@ import {
   updateDraftCv,
   updateVersionCv,
 } from "@/app/actions/edit";
+import { HomeScreen } from "./HomeScreen";
 import { CvPaper } from "./CvPaper";
+import { CvDiffView } from "./CvDiffView";
 import { CvEditor } from "./CvEditor";
+import { IntakePanel } from "./IntakePanel";
 import { SettingsModal } from "./SettingsModal";
 import { FONTS, DEFAULT_FONT } from "@/lib/fonts";
+
+/** Which workspace is open. Each of the three does a different job and needs
+ *  different furniture, so they don't share one screen — "home" is the chooser
+ *  that decides between them. */
+type WorkspaceView = "home" | "edit" | "tailor" | "create";
+
+const VIEW_LABEL: Record<Exclude<WorkspaceView, "home">, string> = {
+  edit: "Edit my CV with AI",
+  tailor: "Tailor to a job",
+  create: "Create a new CV",
+};
+
+/** The right-hand pane's views. Match and Diff depend on what is selected, so
+ *  which of them exist is decided per render. */
+type RightTab = "preview" | "match" | "diff";
 
 const LS_WIDTH = "fitted.rightWidth";
 const LS_THEME = "fitted.theme";
@@ -111,8 +137,14 @@ export function Dashboard({
   const [versions, setVersions] = useState(initialVersions);
   const [settings, setSettings] = useState(initialSettings);
 
+  // Newest first, but skipping the empty ones: opening on a blank CV left
+  // every workspace useless until you noticed and switched.
   const [activeCvId, setActiveCvId] = useState<string | null>(
-    initialCvs[0]?.id ?? null
+    (
+      initialCvs.find(
+        (c) => c.structured.name || (c.structured.experience?.length ?? 0) > 0
+      ) ?? initialCvs[0]
+    )?.id ?? null
   );
   const [conversation, setConversation] = useState<ConversationDto | null>(null);
   const [selectedVersionId, setSelectedVersionId] = useState<string | null>(
@@ -120,12 +152,44 @@ export function Dashboard({
   );
 
   const [jd, setJd] = useState("");
-  const [chatInput, setChatInput] = useState("");
+  // Tailor and Edit are two separate chat threads over the same draft CV.
+  // "tailor" only reshuffles what the base CV already evidences; "edit" treats
+  // what the user types as fact, so they can add real projects/experience.
+  const [chatMode, setChatMode] = useState<ChatMode>("tailor");
+  // One composer draft per thread, so switching tabs never eats what you typed.
+  const [chatInputs, setChatInputs] = useState<Record<ChatMode, string>>({
+    tailor: "",
+    edit: "",
+  });
+  // Which thread the in-flight request belongs to, so the thinking bubble
+  // doesn't appear in the other tab.
+  const [sendingMode, setSendingMode] = useState<ChatMode>("tailor");
+  const chatInput = chatInputs[chatMode];
+  const setChatInput = (v: string) =>
+    setChatInputs((prev) => ({ ...prev, [chatMode]: v }));
   const [busy, setBusy] = useState<string | null>(null); // "upload" | "generate" | "send" | "export" | "save"
   const [showSettings, setShowSettings] = useState(false);
   const [saveName, setSaveName] = useState<string | null>(null); // non-null = modal open
+  const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(
+    null
+  );
   const [editing, setEditing] = useState(false);
-  const [tab, setTab] = useState<"preview" | "match">("preview");
+  const [view, setView] = useState<WorkspaceView>("home");
+  // Bumped whenever the CV under the editor is replaced from outside it (an
+  // accepted proposal), so the form reloads instead of holding a stale copy.
+  const [editorKey, setEditorKey] = useState(0);
+  const [tab, setTab] = useState<RightTab>("preview");
+  // Raw model output for the generation in flight. It is re-parsed as it grows
+  // into whatever CV has been written so far, so the preview fills in live
+  // rather than sitting behind a spinner for a minute.
+  const [streamRaw, setStreamRaw] = useState("");
+  // A proposed rewrite of the BASE CV — from the guided intake, or from folding
+  // in the facts given in Edit mode. Held out of the database until the user
+  // has seen the diff and accepted it.
+  const [proposal, setProposal] = useState<{
+    cv: StructuredCv;
+    changeSummary: string;
+  } | null>(null);
   const [jdOpen, setJdOpen] = useState(false);
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(
     null
@@ -209,6 +273,53 @@ export function Dashboard({
     return null;
   }, [conversation, selectedVersion, activeCv]);
 
+  // Whatever the model has emitted so far this turn, as a renderable CV. The
+  // JSON is truncated mid-token on nearly every frame, hence the tolerant parse.
+  const streamingCv: StructuredCv | null = useMemo(() => {
+    if (!streamRaw) return null;
+    const partial = parsePartialJson<{ cv?: unknown }>(streamRaw);
+    return partial?.cv ? coercePartialCv(partial.cv) : null;
+  }, [streamRaw]);
+
+  // What the right-hand pane paints. A proposal or an in-flight generation
+  // takes over the view, but previewCv stays the thing that gets exported or
+  // hand-edited — neither of those is saved yet.
+  const shownCv = streamingCv ?? proposal?.cv ?? previewCv;
+
+  // The tailored/edited CV against the base CV it came from. Identity holds
+  // when the base CV is itself being previewed, and there is no diff to show.
+  const diff = useMemo(() => {
+    const base = activeCv?.structured;
+    const target = proposal?.cv ?? previewCv;
+    if (!base || !target || base === target) return null;
+    return diffCv(base, target);
+  }, [activeCv, previewCv, proposal]);
+
+  const hasDiff = !!diff && !diff.empty;
+
+  // Everything the user has asserted in Edit mode — the facts that exist only
+  // in this conversation until they are written back to the base CV.
+  const editFacts = useMemo(
+    () =>
+      (conversation?.messages || [])
+        .filter((m) => m.role === "user" && m.mode === "edit")
+        .map((m) => m.content),
+    [conversation]
+  );
+
+  // The two chat threads are just the message list split by mode.
+  const threadMessages = useMemo(
+    () => conversation?.messages.filter((m) => m.mode === chatMode) ?? [],
+    [conversation, chatMode]
+  );
+  const threadCounts = useMemo(
+    () => ({
+      tailor: conversation?.messages.filter((m) => m.mode === "tailor").length ?? 0,
+      edit: conversation?.messages.filter((m) => m.mode === "edit").length ?? 0,
+    }),
+    [conversation]
+  );
+
   const matchScore =
     conversation?.lastResult?.matchScore ?? selectedVersion?.matchScore ?? null;
 
@@ -223,10 +334,15 @@ export function Dashboard({
   const hasMatch = matchScore != null;
   const gapCount = matchNotes?.gaps?.length ?? 0;
 
-  // Derived rather than corrected in an effect: selecting a plain base CV leaves
-  // nothing to show on the Match tab, so fall back to Preview for that render
+  // Derived rather than corrected in an effect: a tab whose content doesn't
+  // exist for the current selection falls back to Preview for that render,
   // instead of painting an empty tab and then fixing it up.
-  const activeTab = hasMatch ? tab : "preview";
+  const tabAvailable: Record<RightTab, boolean> = {
+    preview: true,
+    match: hasMatch,
+    diff: hasDiff,
+  };
+  const activeTab: RightTab = tabAvailable[tab] ? tab : "preview";
 
   function flash(msg: string, err = false) {
     setToast({ msg, err });
@@ -268,6 +384,140 @@ export function Dashboard({
     setConversation(null);
     setSelectedVersionId(null);
     setEditing(false);
+    setChatMode("tailor");
+    setProposal(null);
+    setTab("preview");
+    // Switching CVs inside the edit workspace should switch which CV you are
+    // editing, not drop you into an empty pane.
+    if (view === "edit") void enterEdit(id);
+  }
+
+  /** Back to the chooser, with nothing from the last workspace left behind. */
+  function goHome() {
+    setView("home");
+    setConversation(null);
+    setSelectedVersionId(null);
+    setEditing(false);
+    setProposal(null);
+    setJd("");
+    setTab("preview");
+    setChatMode("tailor");
+  }
+
+  /** Open the AI edit workspace for a CV, resuming that CV's session if it
+   *  already has one — the chat is a record of what you've told the model
+   *  about yourself, and starting over would throw it away. */
+  async function enterEdit(cvId: string) {
+    setBusy("session");
+    try {
+      const conv = await startEditSession(cvId);
+      setActiveCvId(cvId);
+      setConversation(conv);
+      setSelectedVersionId(null);
+      setProposal(null);
+      setChatMode("edit");
+      setTab("preview");
+      setView("edit");
+      scrollChat();
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Could not open the editor", true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function enterTailor() {
+    setConversation(null);
+    setSelectedVersionId(null);
+    setProposal(null);
+    setChatMode("tailor");
+    setTab("preview");
+    setView("tailor");
+  }
+
+  /** Save an edit session's draft over the CV it belongs to. Until this runs
+   *  the chat has changed nothing permanent. */
+  async function handleSaveToCv() {
+    if (!conversation?.draft || !activeCv) return;
+    const saved = conversation.draft;
+    setBusy("save");
+    try {
+      await saveEditToCv(conversation.id);
+      setCvs((prev) =>
+        prev.map((c) => (c.id === activeCv.id ? { ...c, structured: saved } : c))
+      );
+      flash("Saved to your CV");
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Save failed", true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Start a CV with nothing in it, for someone who has no PDF to upload. It
+   *  opens straight into the editor — an empty CV has nothing to preview. */
+  async function handleCreateBlank() {
+    setBusy("upload");
+    try {
+      const cv = await createBlankCv();
+      setCvs((prev) => [cv, ...prev]);
+      setActiveCvId(cv.id);
+      setConversation(null);
+      setSelectedVersionId(null);
+      setProposal(null);
+      setEditing(true);
+      setTab("preview");
+      setView("create");
+      flash("Blank CV created — fill it in");
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Could not create a CV", true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Fold the facts given in Edit mode back into the base CV.
+   *
+   *  Without this they live only in this conversation's message ledger, and
+   *  every future job re-derives them from a CV that still doesn't mention
+   *  them. The result is proposed, not saved — see applyProposal. */
+  async function proposeFromFacts() {
+    if (!activeCv || editFacts.length === 0) return;
+    setBusy("proposal");
+    try {
+      setProposal(await proposeCvUpdate(activeCv.id, editFacts));
+      flash("Review the changes, then apply them");
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Could not update the CV", true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function applyProposal() {
+    if (!proposal || !activeCv) return;
+    const next = proposal.cv;
+    setBusy("proposal");
+    try {
+      await updateBaseCv(activeCv.id, next);
+      setCvs((prev) =>
+        prev.map((c) => (c.id === activeCv.id ? { ...c, structured: next } : c))
+      );
+      setProposal(null);
+      setTab("preview");
+      setEditorKey((k) => k + 1);
+      flash("Base CV updated");
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Save failed", true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Switch chat thread. Each thread keeps its own messages and composer text. */
+  function selectChatMode(mode: ChatMode) {
+    setChatMode(mode);
+    scrollChat();
   }
 
   function selectVersion(v: VersionDto) {
@@ -275,6 +525,57 @@ export function Dashboard({
     setActiveCvId(v.cvId);
     setConversation(null);
     setEditing(false);
+  }
+
+  /** Drive one of the streaming endpoints: relay deltas into the live preview,
+   *  then hand back the conversation the server persisted.
+   *
+   *  Failures arrive as a terminal event rather than an HTTP status, because by
+   *  the time the model fails the response has usually already started. */
+  async function runStream(
+    url: string,
+    payload: Record<string, unknown>
+  ): Promise<ConversationDto> {
+    setStreamRaw("");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error(body?.error || `Request failed (${res.status}).`);
+    }
+
+    // Written by the callback, read after it — a plain `let` would be narrowed
+    // to null by control-flow analysis that can't see into the callback.
+    const out: { conversation?: ConversationDto; error?: string } = {};
+    let raw = "";
+    let painted = 0;
+
+    await readStream(res, (event) => {
+      if (event.type === "delta") {
+        raw += event.text;
+        // Deltas land far faster than the eye can read. Repainting on each one
+        // would re-render (and re-parse the whole document) dozens of times a
+        // second for no visible gain.
+        const now = Date.now();
+        if (now - painted > 120) {
+          painted = now;
+          setStreamRaw(raw);
+        }
+      } else if (event.type === "done") {
+        out.conversation = event.conversation;
+      } else {
+        out.error = event.message;
+      }
+    });
+
+    if (out.error) throw new Error(out.error);
+    if (!out.conversation) {
+      throw new Error("The connection closed before the CV was finished.");
+    }
+    return out.conversation;
   }
 
   async function handleGenerate() {
@@ -286,7 +587,7 @@ export function Dashboard({
       if (!conv || conv.cvId !== activeCv.id) {
         conv = await createConversation(activeCv.id, { description: jd });
       }
-      const updated = await generateTailoredCv(conv.id);
+      const updated = await runStream("/api/tailor", { conversationId: conv.id });
       setConversation(updated);
       setSelectedVersionId(null);
       setJdOpen(false);
@@ -295,29 +596,63 @@ export function Dashboard({
     } catch (err) {
       flash(err instanceof Error ? err.message : "Generation failed", true);
     } finally {
+      setStreamRaw("");
       setBusy(null);
     }
   }
 
   async function handleSend() {
     if (!conversation || !chatInput.trim()) return;
-    const msg = chatInput;
-    setChatInput("");
+    const msg = chatInput.trim();
+    const conv = conversation;
+    // Pinned for the whole request: the user may switch tabs while it runs, and
+    // the reply must land back in the thread it was sent from.
+    const mode = chatMode;
+
+    // Show the message immediately. sendChatMessage doesn't resolve until the
+    // model has re-emitted the entire CV, so without this the text would vanish
+    // from the composer and reappear a minute later — it reads as a lost message.
+    // The server is the source of truth: its response replaces this outright.
+    const pending: MessageDto = {
+      id: `pending-${conv.messages.length}-${msg.length}`,
+      role: "user",
+      content: msg,
+      mode,
+      createdAt: new Date().toISOString(),
+    };
+    setChatInputs((prev) => ({ ...prev, [mode]: "" }));
+    setConversation({ ...conv, messages: [...conv.messages, pending] });
+    setSendingMode(mode);
     setBusy("send");
+    scrollChat();
+
     try {
-      const updated = await sendChatMessage(conversation.id, msg);
+      // An edit session has no job, so it goes to the endpoint that doesn't
+      // try to score the result against one.
+      const updated = await runStream(
+        view === "edit" ? "/api/edit" : "/api/chat",
+        view === "edit"
+          ? { conversationId: conv.id, message: msg }
+          : { conversationId: conv.id, message: msg, mode }
+      );
       setConversation(updated);
       scrollChat();
     } catch (err) {
+      // Drop the optimistic message and hand the text back so it isn't lost.
+      setConversation((c) =>
+        c ? { ...c, messages: c.messages.filter((m) => m.id !== pending.id) } : c
+      );
+      setChatInputs((prev) => ({ ...prev, [mode]: msg }));
       flash(err instanceof Error ? err.message : "Message failed", true);
     } finally {
+      setStreamRaw("");
       setBusy(null);
     }
   }
 
   function openSave() {
     if (!conversation?.draft) return;
-    setSaveName(conversation.job.title);
+    setSaveName(conversation.job?.title ?? activeCv?.title ?? "Version");
   }
 
   async function confirmSave() {
@@ -345,7 +680,7 @@ export function Dashboard({
       } else if (previewCv) {
         res = await exportCvPdf(
           previewCv,
-          conversation?.job.title ?? activeCv?.title ?? "cv"
+          conversation?.job?.title ?? activeCv?.title ?? "cv"
         );
       } else {
         return;
@@ -411,6 +746,49 @@ export function Dashboard({
     }
   }
 
+  async function confirmRename() {
+    if (!renaming?.title.trim()) return;
+    const { id, title } = renaming;
+    setBusy("rename");
+    try {
+      await renameCv(id, title);
+      setCvs((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
+      setRenaming(null);
+      flash("Renamed");
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Rename failed", true);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Delete a CV and everything hanging off it. Without this the list only ever
+   *  grows, and "start from scratch" makes empty ones cheap to create. */
+  async function handleDeleteCv(cv: CvDto) {
+    const vs = versions.filter((v) => v.cvId === cv.id).length;
+    const warning = vs
+      ? ` and its ${vs} saved version${vs === 1 ? "" : "s"}`
+      : "";
+    if (!window.confirm(`Delete "${cv.title}"${warning}? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      await deleteCv(cv.id);
+      const left = cvs.filter((c) => c.id !== cv.id);
+      setCvs(left);
+      setVersions((prev) => prev.filter((v) => v.cvId !== cv.id));
+      if (activeCvId === cv.id) {
+        setActiveCvId(left[0]?.id ?? null);
+        setConversation(null);
+        setSelectedVersionId(null);
+        setProposal(null);
+      }
+      flash("CV deleted");
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "Delete failed", true);
+    }
+  }
+
   async function handleDeleteVersion(v: VersionDto, e: React.MouseEvent) {
     e.stopPropagation();
     if (!window.confirm(`Delete version "${v.name}"?`)) return;
@@ -437,6 +815,18 @@ export function Dashboard({
             <small>Your CV, cut for the job</small>
           </div>
         </div>
+        {view !== "home" && (
+          <>
+            <button
+              className="icon-btn back-btn"
+              title="Back to the start"
+              onClick={goHome}
+            >
+              <ArrowLeft size={15} />
+            </button>
+            <span className="view-title">{VIEW_LABEL[view]}</span>
+          </>
+        )}
         <div className="spacer" />
         <button className="model-pill" onClick={() => setShowSettings(true)}>
           <span className={settings.hasApiKey ? "dot" : "dot off"} />
@@ -456,6 +846,30 @@ export function Dashboard({
         </button>
       </div>
 
+      {/* Outside the workspace grid: the home screen uploads through it too. */}
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/pdf"
+        hidden
+        onChange={handleUpload}
+      />
+
+      {view === "home" ? (
+        <HomeScreen
+          cvs={cvs}
+          versions={versions}
+          activeCvId={activeCvId}
+          busy={busy}
+          onSelectCv={setActiveCvId}
+          onEdit={() => activeCvId && enterEdit(activeCvId)}
+          onTailor={enterTailor}
+          onCreate={handleCreateBlank}
+          onUpload={() => fileRef.current?.click()}
+          onRename={(cv) => setRenaming({ id: cv.id, title: cv.title })}
+          onDelete={handleDeleteCv}
+        />
+      ) : (
       <div className="grid" ref={gridRef}>
         {/* LEFT: My CVs */}
         <div className="panel">
@@ -465,6 +879,13 @@ export function Dashboard({
             <div className="spacer" />
             <button
               className="icon-btn"
+              title="Start a CV from scratch"
+              onClick={handleCreateBlank}
+            >
+              <FilePlus size={15} />
+            </button>
+            <button
+              className="icon-btn"
               title="Upload a CV"
               onClick={() => fileRef.current?.click()}
             >
@@ -472,38 +893,41 @@ export function Dashboard({
             </button>
           </div>
           <div className="side-body">
-            <input
-              ref={fileRef}
-              type="file"
-              accept="application/pdf"
-              hidden
-              onChange={handleUpload}
-            />
 
-            {cvs.length === 0 ? (
-              <button
-                className={`upload ${busy === "upload" ? "busy" : ""}`}
-                onClick={() => fileRef.current?.click()}
-              >
-                <div className="u-ico">
-                  {busy === "upload" ? (
-                    <span className="spin" />
-                  ) : (
-                    <FileUp size={24} />
-                  )}
-                </div>
-                <b>{busy === "upload" ? "Parsing your CV…" : "Upload your CV"}</b>
-                <span>Drop a PDF here or click to browse</span>
-              </button>
-            ) : (
-              busy === "upload" && (
-                <div className="upload busy">
+            {cvs.length === 0 && (
+              <>
+                <button
+                  className={`upload ${busy === "upload" ? "busy" : ""}`}
+                  onClick={() => fileRef.current?.click()}
+                >
                   <div className="u-ico">
-                    <span className="spin" />
+                    {busy === "upload" ? (
+                      <span className="spin" />
+                    ) : (
+                      <FileUp size={24} />
+                    )}
                   </div>
-                  <b>Parsing your CV…</b>
+                  <b>{busy === "upload" ? "Parsing your CV…" : "Upload your CV"}</b>
+                  <span>Drop a PDF here or click to browse</span>
+                </button>
+                {busy !== "upload" && (
+                  <button
+                    className="btn btn-ghost btn-block btn-sm"
+                    onClick={handleCreateBlank}
+                  >
+                    <FilePlus size={14} /> …or start from scratch
+                  </button>
+                )}
+              </>
+            )}
+
+            {cvs.length > 0 && busy === "upload" && (
+              <div className="upload busy">
+                <div className="u-ico">
+                  <span className="spin" />
                 </div>
-              )
+                <b>Parsing your CV…</b>
+              </div>
             )}
 
             {cvs.map((cv) => {
@@ -519,7 +943,7 @@ export function Dashboard({
                       {initials(cv.structured.name || cv.title)}
                     </div>
                     <div className="cv-meta">
-                      <b>{cv.structured.name || cv.title}</b>
+                      <b>{cv.title}</b>
                       <span>
                         {cv.structured.experience?.length ?? 0} roles ·{" "}
                         {vs.length} version{vs.length === 1 ? "" : "s"} ·{" "}
@@ -531,7 +955,7 @@ export function Dashboard({
                     </span>
                   </button>
 
-                  {isActive && (
+                  {isActive && view === "tailor" && (
                     <div className="ver-list">
                       {vs.length === 0 && (
                         <div className="ver-empty">
@@ -586,7 +1010,7 @@ export function Dashboard({
               );
             })}
 
-            {activeCv && (
+            {activeCv && view === "tailor" && (
               <button
                 className="btn btn-ghost btn-block btn-sm new-session"
                 onClick={() => {
@@ -595,6 +1019,8 @@ export function Dashboard({
                   setEditing(false);
                   setJd("");
                   setTab("preview");
+                  setChatMode("tailor");
+                  setProposal(null);
                 }}
               >
                 <Target size={14} /> New tailoring session
@@ -605,6 +1031,7 @@ export function Dashboard({
 
         {/* CENTER: Job description + chat */}
         <div className={`panel chat ${conversation ? "" : "compose"}`}>
+          {view === "tailor" && (
           <div className="jd-bar">
             <div className="jd-label">
               <Target size={13} /> Target job description
@@ -613,7 +1040,7 @@ export function Dashboard({
               <>
                 <button className="jd-chip" onClick={() => setJdOpen((o) => !o)}>
                   <FileText size={14} />
-                  <span className="jd-chip-title">{conversation.job.title}</span>
+                  <span className="jd-chip-title">{conversation.job?.title}</span>
                   <span className="jd-chip-hint">
                     {jdOpen ? "Hide" : "View"}
                     <ChevronDown
@@ -626,7 +1053,7 @@ export function Dashboard({
                   </span>
                 </button>
                 {jdOpen && (
-                  <div className="jd-full">{conversation.job.description}</div>
+                  <div className="jd-full">{conversation.job?.description}</div>
                 )}
               </>
             ) : (
@@ -638,7 +1065,65 @@ export function Dashboard({
               />
             )}
           </div>
+          )}
 
+          {conversation && view === "tailor" && (
+            <div className="chat-tabs">
+              <div className="tabs">
+                <button
+                  className={`tab ${chatMode === "tailor" ? "on" : ""}`}
+                  onClick={() => selectChatMode("tailor")}
+                  title="Reshuffles and rewords what your CV already proves — it will refuse to add anything new."
+                >
+                  <Target size={13} /> Tailor
+                  {threadCounts.tailor > 0 && (
+                    <span className="tab-n">{threadCounts.tailor}</span>
+                  )}
+                </button>
+                <button
+                  className={`tab ${chatMode === "edit" ? "on" : ""}`}
+                  onClick={() => selectChatMode("edit")}
+                  title="Tell it about real work it doesn't know about — a project, a job, a skill — and it writes it in."
+                >
+                  <Pencil size={13} /> Edit
+                  {threadCounts.edit > 0 && (
+                    <span className="tab-n">{threadCounts.edit}</span>
+                  )}
+                </button>
+              </div>
+              <span className="mode-hint">
+                {chatMode === "edit"
+                  ? "What you type is taken as fact and added to the CV."
+                  : "Won't add anything your CV doesn't already evidence."}
+              </span>
+              {chatMode === "edit" && editFacts.length > 0 && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={proposeFromFacts}
+                  disabled={busy !== null}
+                  title="Write these facts into your base CV, so every future job starts from them"
+                >
+                  {busy === "proposal" ? (
+                    <span className="spin" />
+                  ) : (
+                    <>
+                      <Save size={12} /> To base CV
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          )}
+
+          {view === "create" && activeCv ? (
+            <IntakePanel
+              cvId={activeCv.id}
+              cv={activeCv.structured}
+              onProposal={setProposal}
+              onError={(m) => flash(m, true)}
+            />
+          ) : (
+          <>
           <div className="stream" ref={streamRef}>
             {!conversation && (
               <div className="stream-empty">
@@ -653,20 +1138,64 @@ export function Dashboard({
               </div>
             )}
 
-            {conversation?.messages.map((m) => (
-              <div key={m.id} className={`msg ${m.role === "user" ? "user" : "ai"}`}>
+            {conversation && threadMessages.length === 0 && busy !== "send" && (
+              <div className="stream-empty">
+                <div className="se-ico">
+                  {chatMode === "edit" ? <Pencil size={28} /> : <Target size={28} />}
+                </div>
+                <p>
+                  {view === "edit"
+                    ? "Tell me what to change — tighten the summary, add a project, cut a role, add metrics you actually have. Nothing is saved to your CV until you press Save."
+                    : chatMode === "edit"
+                    ? "Tell me about real work this CV is missing — a project, a job, a skill — and I'll write it in. I won't add details you didn't give me."
+                    : "Ask for tweaks — reordering, wording, length. I won't add anything your CV doesn't already evidence."}
+                </p>
+              </div>
+            )}
+
+            {threadMessages.map((m) => (
+              <div
+                key={m.id}
+                className={`msg ${m.role === "user" ? "user" : "ai"} ${
+                  m.id.startsWith("pending-") ? "pending" : ""
+                }`}
+              >
                 <div className={`avatar ${m.role === "user" ? "me" : "ai"}`}>
                   {m.role === "user" ? <User size={14} /> : <Scissors size={14} />}
                 </div>
                 <div className="bubble">{m.content}</div>
               </div>
             ))}
+
+            {busy === "send" && sendingMode === chatMode && (
+              <div className="msg ai">
+                <div className="avatar ai">
+                  <Scissors size={14} />
+                </div>
+                <div className="bubble thinking">
+                  <span className="dots">
+                    <i />
+                    <i />
+                    <i />
+                  </span>
+                  {chatMode === "edit"
+                    ? "Writing that into your CV — this re-generates the whole document, so it takes a moment."
+                    : "Rewriting your CV — this re-generates the whole document, so it takes a moment."}
+                </div>
+              </div>
+            )}
           </div>
 
           {conversation ? (
-            <div className="composer">
+            <div className={`composer mode-${chatMode}`}>
               <textarea
-                placeholder="Ask for a tweak — “make it one page”, “add metrics”…"
+                placeholder={
+                  view === "edit"
+                    ? "What should change? “Tighten my summary”, “add a project: Fitted, built in Next.js”…"
+                    : chatMode === "edit"
+                    ? "Describe real work to add — “add a project: Fitted, a CV tailoring app in Next.js and MySQL”…"
+                    : "Ask for a tweak — “make it one page”, “lead with backend work”…"
+                }
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -703,6 +1232,8 @@ export function Dashboard({
               </button>
             </div>
           )}
+          </>
+          )}
         </div>
 
         {/* Drag handle to resize the job-description / preview split */}
@@ -723,7 +1254,9 @@ export function Dashboard({
           <div className="cvhead">
             {editing ? (
               <h2>Edit CV</h2>
-            ) : hasMatch ? (
+            ) : proposal ? (
+              <h2>Proposed changes</h2>
+            ) : (
               <div className="tabs">
                 <button
                   className={`tab ${activeTab === "preview" ? "on" : ""}`}
@@ -731,16 +1264,34 @@ export function Dashboard({
                 >
                   <FileText size={13} /> Preview
                 </button>
-                <button
-                  className={`tab ${activeTab === "match" ? "on" : ""}`}
-                  onClick={() => setTab("match")}
-                >
-                  <ListChecks size={13} /> Match
-                  <span className="tab-n">{matchScore}%</span>
-                </button>
+                {tabAvailable.match && (
+                  <button
+                    className={`tab ${activeTab === "match" ? "on" : ""}`}
+                    onClick={() => setTab("match")}
+                  >
+                    <ListChecks size={13} /> Match
+                    <span className="tab-n">{matchScore}%</span>
+                  </button>
+                )}
+                {tabAvailable.diff && diff && (
+                  <button
+                    className={`tab ${activeTab === "diff" ? "on" : ""}`}
+                    onClick={() => setTab("diff")}
+                    title="Line by line, what the tailoring changed against your base CV"
+                  >
+                    <GitCompare size={13} /> Diff
+                    <span
+                      className={`tab-n ${
+                        diff.unsupportedSkills.length ? "warn" : ""
+                      }`}
+                    >
+                      {diff.unsupportedSkills.length
+                        ? `${diff.unsupportedSkills.length} ⚠`
+                        : `+${diff.counts.added}`}
+                    </span>
+                  </button>
+                )}
               </div>
-            ) : (
-              <h2>Live Preview</h2>
             )}
 
             {!editing && activeTab === "preview" && previewCv && (
@@ -767,13 +1318,49 @@ export function Dashboard({
             )}
           </div>
 
-          {editing && previewCv ? (
+          {editing && previewCv && !proposal ? (
             <CvEditor
+              key={editorKey}
               initial={previewCv}
               saving={busy === "edit"}
               onCancel={() => setEditing(false)}
               onSave={handleSaveEdit}
             />
+          ) : proposal ? (
+            <div className="paper-wrap">
+              <div className="proposal">
+                <div className="proposal-sum">{proposal.changeSummary}</div>
+                <div className="proposal-actions">
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => setProposal(null)}
+                    disabled={busy === "proposal"}
+                  >
+                    <Undo2 size={13} /> Discard
+                  </button>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={applyProposal}
+                    disabled={busy === "proposal"}
+                  >
+                    {busy === "proposal" ? (
+                      <span className="spin" />
+                    ) : (
+                      <>
+                        <Check size={13} /> Apply to base CV
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+              {diff ? (
+                <CvDiffView diff={diff} title="What this would change" />
+              ) : (
+                <div className="hint">
+                  This changes nothing in your base CV.
+                </div>
+              )}
+            </div>
           ) : activeTab === "match" && matchScore != null ? (
             <div className="gaps">
               <div className="gaps-hero">
@@ -804,7 +1391,7 @@ export function Dashboard({
                   ) : (
                     <span>
                       Scored against{" "}
-                      {selectedVersion?.jobTitle ?? conversation?.job.title ?? "this job"}.
+                      {selectedVersion?.jobTitle ?? conversation?.job?.title ?? "this job"}.
                     </span>
                   )}
                 </div>
@@ -847,35 +1434,73 @@ export function Dashboard({
                 </div>
               )}
             </div>
+          ) : activeTab === "diff" && diff ? (
+            <div className="paper-wrap">
+              <CvDiffView
+                diff={diff}
+                title={`Against ${activeCv?.structured.name || "your base CV"}`}
+              />
+            </div>
           ) : (
             <div className="paper-wrap">
-              {previewCv ? (
-                <CvPaper cv={previewCv} />
+              {streamingCv && (
+                <div className="stream-badge">
+                  <span className="dots">
+                    <i />
+                    <i />
+                    <i />
+                  </span>
+                  Writing your CV…
+                </div>
+              )}
+              {shownCv ? (
+                <CvPaper cv={shownCv} />
               ) : (
                 <div
                   className="empty"
                   style={{ textAlign: "center", padding: 40 }}
                 >
-                  Upload a CV to see the preview.
+                  Upload a CV — or start one from scratch — to see the preview.
                 </div>
               )}
             </div>
           )}
 
-          <div className="cvfoot" style={{ display: editing ? "none" : "flex" }}>
-            <button
-              className="btn btn-ghost btn-block btn-sm"
-              disabled={!conversation?.draft || busy === "save"}
-              onClick={openSave}
-            >
-              {busy === "save" ? (
-                <span className="spin" />
-              ) : (
-                <>
-                  <Save size={14} /> Save version
-                </>
-              )}
-            </button>
+          <div
+            className="cvfoot"
+            style={{ display: editing || proposal ? "none" : "flex" }}
+          >
+            {view === "tailor" && (
+              <button
+                className="btn btn-ghost btn-block btn-sm"
+                disabled={!conversation?.draft || busy === "save"}
+                onClick={openSave}
+              >
+                {busy === "save" ? (
+                  <span className="spin" />
+                ) : (
+                  <>
+                    <Save size={14} /> Save version
+                  </>
+                )}
+              </button>
+            )}
+            {view === "edit" && (
+              <button
+                className="btn btn-ghost btn-block btn-sm"
+                disabled={!conversation?.draft || busy === "save" || !hasDiff}
+                onClick={handleSaveToCv}
+                title="Write these changes over your CV"
+              >
+                {busy === "save" ? (
+                  <span className="spin" />
+                ) : (
+                  <>
+                    <Save size={14} /> Save to my CV
+                  </>
+                )}
+              </button>
+            )}
             <button
               className="btn btn-primary btn-block btn-sm"
               disabled={!previewCv || busy === "export"}
@@ -892,6 +1517,7 @@ export function Dashboard({
           </div>
         </div>
       </div>
+      )}
 
       {showSettings && (
         <SettingsModal
@@ -903,6 +1529,51 @@ export function Dashboard({
             flash("Settings saved");
           }}
         />
+      )}
+
+      {renaming && (
+        <div className="overlay" onClick={() => setRenaming(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="m-head">
+              <Pencil size={15} /> Rename CV
+            </div>
+            <div className="m-body">
+              <div>
+                <label className="field-l">Name</label>
+                <input
+                  className="input"
+                  autoFocus
+                  value={renaming.title}
+                  onChange={(e) =>
+                    setRenaming({ ...renaming, title: e.target.value })
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") confirmRename();
+                  }}
+                />
+                <div className="hint">
+                  Only what this CV is called here — it never appears on the CV
+                  itself.
+                </div>
+              </div>
+            </div>
+            <div className="m-foot">
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setRenaming(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={confirmRename}
+                disabled={busy === "rename" || !renaming.title.trim()}
+              >
+                {busy === "rename" ? <span className="spin" /> : "Rename"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {saveName !== null && (

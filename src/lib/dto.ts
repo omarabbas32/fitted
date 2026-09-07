@@ -1,4 +1,4 @@
-import type { StructuredCv, MatchNotes } from "./cv-schema";
+import type { StructuredCv, MatchNotes, ChatMode } from "./cv-schema";
 
 export type CvDto = {
   id: string;
@@ -12,6 +12,8 @@ export type MessageDto = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** On user messages: how the request was interpreted. */
+  mode: ChatMode;
   createdAt: string;
 };
 
@@ -33,14 +35,16 @@ export type VersionDto = {
 export type ConversationDto = {
   id: string;
   cvId: string;
-  jobId: string;
-  job: { title: string; company: string | null; description: string };
+  /** Null on an edit session: there is no job in play. */
+  jobId: string | null;
+  job: { title: string; company: string | null; description: string } | null;
   draft: StructuredCv | null;
+  /** Scores are null on an edit session — nothing to score against. */
   lastResult: {
     changeSummary: string;
-    matchScore: number;
-    baseMatchScore: number;
-    matchNotes: MatchNotes;
+    matchScore: number | null;
+    baseMatchScore: number | null;
+    matchNotes: MatchNotes | null;
   } | null;
   messages: MessageDto[];
 };

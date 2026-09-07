@@ -36,13 +36,17 @@ model Job {
   versions      CvVersion[]
 }
 
-/// One tailoring session: a base CV + a job + the chat + the working draft.
+/// One working session over a CV: the chat plus the working draft.
+///
+/// The job is optional. With one, this is a tailoring session and the draft is
+/// scored against that job; without one, it is a plain "edit my CV with AI"
+/// session, where there is nothing to score against and matchScore is null.
 model Conversation {
   id        String      @id @default(cuid())
   cv        Cv          @relation(fields: [cvId], references: [id], onDelete: Cascade)
   cvId      String
-  job       Job         @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  jobId     String
+  job       Job?        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId     String?
   draft     Json? // current working structured CV (before saving a version)
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
@@ -61,6 +65,9 @@ model Message {
   conversationId String
   role           String // "user" | "assistant"
   content        String       @db.LongText
+  /// "tailor" | "edit" — on user messages, how the request was interpreted.
+  /// Edit-mode messages double as the conversation's ledger of user-supplied facts.
+  mode           String       @default("tailor")
   createdAt      DateTime     @default(now())
 
   @@index([conversationId])
